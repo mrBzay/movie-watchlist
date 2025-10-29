@@ -28,6 +28,7 @@ A Next.js watchlist that keeps your favourite films organised with rich metadata
    - `DATABASE_URL` – main connection string from Vercel Postgres
    - `DIRECT_URL` – (optional) direct connection string for migrations/seed scripts
    - `DEFAULT_USER_EMAIL` – fallback identifier for local development (defaults to `demo@example.com`)
+   > Developing locally? Point `DATABASE_URL` at your personal Postgres instance (e.g. `postgres://user:password@localhost:5432/watchlist?sslmode=disable`). The data layer detects localhost/non-pooled URLs and automatically switches to a native `pg` client so you can run without the Vercel pooler.
 3. **Run the app locally**:
    ```bash
    npm run dev
