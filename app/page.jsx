@@ -1,5 +1,19 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { Film, Plus, Trash2, Star, Search, Settings as SettingsIcon, Loader2, Pencil, CheckCircle, Circle } from 'lucide-react';
+'use client';
+
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  Film,
+  Plus,
+  Trash2,
+  Star,
+  Search,
+  Settings as SettingsIcon,
+  Loader2,
+  Pencil,
+  CheckCircle,
+  Circle,
+  CloudDownload,
+} from 'lucide-react';
 
 const STORAGE_KEYS = {
   watchlist: 'watchlist.v1',
@@ -29,40 +43,53 @@ function parseNumeric(value, min, max) {
 }
 
 function computeScores(movie) {
-  const imdb10 = parseNumeric(movie.imdb, 0, 10);
-  const rtCriticsPct = parseNumeric(movie.rottenTomatoes, 0, 100);
-  const metacriticPct = parseNumeric(movie.metacritic, 0, 100);
+  // existing helpers assumed:
+  // parseNumeric(value, min, max) -> number | null
 
+  const imdb10 = parseNumeric(movie.imdb, 0, 10);               // e.g. "8.3/10" -> 8.3
+  const rtCriticsPct = parseNumeric(movie.rottenTomatoes, 0, 100); // e.g. "93%" -> 93
+  const metacriticPct = parseNumeric(movie.metacritic, 0, 100);    // e.g. "90/100" -> 90
+  const letterboxd5 = parseNumeric(movie.letterboxd, 0, 5);        // e.g. "4.2/5" or 4.2 -> 4.2
+
+  // Updated base weights (sum to 1.0). Letterboxd added at 10%.
   const weights = {
-    imdb: 0.5,
+    imdb: 0.4,
     rtCritics: 0.3,
     metacritic: 0.2,
+    letterboxd: 0.1,
   };
 
   let weightedSum = 0;
   let totalWeight = 0;
 
   if (typeof imdb10 === 'number') {
-    weightedSum += (imdb10 * 10) * weights.imdb;
+    weightedSum += imdb10 * 10 * weights.imdb;        // 1–10 -> 10–100
     totalWeight += weights.imdb;
   }
   if (typeof rtCriticsPct === 'number') {
-    weightedSum += rtCriticsPct * weights.rtCritics;
+    weightedSum += rtCriticsPct * weights.rtCritics;  // already 0–100
     totalWeight += weights.rtCritics;
   }
   if (typeof metacriticPct === 'number') {
-    weightedSum += metacriticPct * weights.metacritic;
+    weightedSum += metacriticPct * weights.metacritic; // already 0–100
     totalWeight += weights.metacritic;
   }
+  if (typeof letterboxd5 === 'number') {
+    weightedSum += letterboxd5 * 20 * weights.letterboxd; // 0–5 -> 0–100
+    totalWeight += weights.letterboxd;
+  }
 
-  const combinedScore = totalWeight > 0 ? weightedSum / totalWeight : null;
+  const combinedScore = totalWeight > 0 ? Math.round((weightedSum / totalWeight) * 100) / 100 : null;
+
   return {
     imdb10,
     rtCriticsPct,
     metacriticPct,
-    combinedScore,
+    letterboxd5,
+    combinedScore, // 0–100
   };
 }
+
 
 function describeCombinedScore(score) {
   if (typeof score !== 'number') return null;
@@ -98,9 +125,10 @@ function useLocalStorageState(key, defaultValue) {
 
 function normalizeLegacyMovie(movie) {
   if (!movie) return null;
-  const addedAt = typeof movie.addedAt === 'number'
-    ? movie.addedAt
-    : Date.parse(movie.addedDate || '') || Date.now();
+  const addedAt =
+    typeof movie.addedAt === 'number'
+      ? movie.addedAt
+      : Date.parse(movie.addedDate || '') || Date.now();
   return {
     id: movie.id || generateId(),
     title: movie.title || '',
@@ -122,7 +150,7 @@ function ensurePercent(value) {
 }
 
 export default function MovieWatchlist() {
-  const [movies, setMovies] = useLocalStorageState(STORAGE_KEYS.watchlist, []);
+  const [movies, setMovies] = useState([]);
   const [omdbKey, setOmdbKey] = useLocalStorageState(STORAGE_KEYS.omdb, '');
   const [showForm, setShowForm] = useState(false);
   const [query, setQuery] = useState('');
@@ -133,23 +161,90 @@ export default function MovieWatchlist() {
   const [showSettings, setShowSettings] = useState(false);
   const [formData, setFormData] = useState(() => createEmptyMovie());
   const [editingMovieId, setEditingMovieId] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isMigrating, setIsMigrating] = useState(false);
+  const [hasMigratedLocal, setHasMigratedLocal] = useState(false);
+
+  const fetchWatchlist = useCallback(async () => {
+    try {
+      setIsLoading(true);
+      setMessage('');
+      const response = await fetch('/api/watchlist', { cache: 'no-store' });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || 'Failed to load watchlist');
+      }
+      setMovies(Array.isArray(data?.movies) ? data.movies : []);
+    } catch (error) {
+      console.error('Failed to fetch watchlist', error);
+      setMessage(error?.message || 'Unable to load watchlist');
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchWatchlist();
+  }, [fetchWatchlist]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    if (movies.length > 0) return;
-    try {
-      const legacyRaw = window.localStorage.getItem(STORAGE_KEYS.legacy);
-      if (!legacyRaw) return;
-      const parsed = JSON.parse(legacyRaw);
-      if (!Array.isArray(parsed) || parsed.length === 0) return;
-      const migrated = parsed.map(normalizeLegacyMovie).filter(Boolean);
-      if (migrated.length) {
-        setMovies(migrated);
+    if (isLoading || hasMigratedLocal || movies.length > 0) return;
+
+    const migrate = async () => {
+      try {
+        const stored = window.localStorage.getItem(STORAGE_KEYS.watchlist);
+        const legacyRaw = window.localStorage.getItem(STORAGE_KEYS.legacy);
+        const fromStored = stored ? JSON.parse(stored) : [];
+        const fromLegacy = legacyRaw ? JSON.parse(legacyRaw) : [];
+        const normalizedLegacy = Array.isArray(fromLegacy)
+          ? fromLegacy.map(normalizeLegacyMovie).filter(Boolean)
+          : [];
+
+        const toImport = [];
+        if (Array.isArray(fromStored)) {
+          toImport.push(...fromStored);
+        }
+        toImport.push(...normalizedLegacy);
+
+        if (!toImport.length) {
+          setHasMigratedLocal(true);
+          return;
+        }
+
+        setIsMigrating(true);
+        setMessage('Importing your existing local watchlist…');
+
+        for (const entry of toImport) {
+          const payload = buildPayloadFromMovie(entry);
+          const response = await fetch('/api/watchlist', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data?.error || 'Failed to import movie');
+          }
+        }
+
+        window.localStorage.removeItem(STORAGE_KEYS.watchlist);
+        window.localStorage.removeItem(STORAGE_KEYS.legacy);
+
+        await fetchWatchlist();
+        setMessage('Imported watchlist from local storage.');
+      } catch (error) {
+        console.error('Local watchlist import failed', error);
+        setMessage('Failed to import saved watchlist. You can re-add movies manually.');
+      } finally {
+        setIsMigrating(false);
+        setHasMigratedLocal(true);
       }
-    } catch (err) {
-      console.error('Failed to migrate legacy watchlist', err);
-    }
-  }, [movies.length, setMovies]);
+    };
+
+    migrate();
+  }, [fetchWatchlist, hasMigratedLocal, isLoading, movies.length]);
 
   const filteredMovies = useMemo(() => {
     const search = query.trim().toLowerCase();
@@ -190,51 +285,77 @@ export default function MovieWatchlist() {
     return list;
   }, [movies, query, sortBy, statusFilter]);
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     const trimmedTitle = formData.title.trim();
     if (!trimmedTitle) {
       setMessage('Please enter a movie title before saving.');
       return;
     }
 
-    const cleanedMovie = {
+    const payload = buildPayloadFromMovie({
       ...formData,
       title: trimmedTitle,
-      year: formData.year.trim(),
-      imdb: formData.imdb.trim(),
-      rottenTomatoes: formData.rottenTomatoes.trim().replace(/%/g, ''),
-      metacritic: formData.metacritic.trim().replace(/[^0-9.]/g, ''),
-      posterUrl: formData.posterUrl.trim(),
-      plot: formData.plot.trim(),
-      letterboxd: formData.letterboxd.trim(),
-      watched: Boolean(formData.watched),
-    };
+      rottenTomatoes: formData.rottenTomatoes.replace(/%/g, ''),
+      metacritic: formData.metacritic.replace(/[^0-9.]/g, ''),
+    });
 
-    if (editingMovieId) {
-      const preservedAddedAt = formData.addedAt ?? Date.now();
-      const movieToUpdate = {
-        ...cleanedMovie,
-        id: editingMovieId,
-        addedAt: preservedAddedAt,
-      };
-      setMovies((current) => current.map((movie) => (movie.id === editingMovieId ? movieToUpdate : movie)));
-    } else {
-      const movieToAdd = {
-        ...cleanedMovie,
-        id: formData.id || generateId(),
-        addedAt: Date.now(),
-      };
-      setMovies((current) => [movieToAdd, ...current]);
+    try {
+      setIsSaving(true);
+      setMessage('');
+
+      if (editingMovieId) {
+        const response = await fetch(`/api/watchlist/${editingMovieId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data?.error || 'Failed to update movie');
+        }
+        setMovies((current) =>
+          current.map((movie) => (movie.id === editingMovieId ? data.movie : movie)),
+        );
+      } else {
+        const response = await fetch('/api/watchlist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data?.error || 'Failed to add movie');
+        }
+        setMovies((current) => [data.movie, ...current]);
+      }
+
+      setFormData(createEmptyMovie());
+      setEditingMovieId(null);
+      setShowForm(false);
+    } catch (error) {
+      console.error('Saving movie failed', error);
+      setMessage(error?.message || 'Unable to save movie.');
+    } finally {
+      setIsSaving(false);
     }
-
-    setFormData(createEmptyMovie());
-    setEditingMovieId(null);
-    setShowForm(false);
-    setMessage('');
   };
 
-  const deleteMovie = (id) => {
-    setMovies((current) => current.filter((movie) => movie.id !== id));
+  const deleteMovie = async (id) => {
+    try {
+      setIsSaving(true);
+      setMessage('');
+      const response = await fetch(`/api/watchlist/${id}`, { method: 'DELETE' });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || 'Failed to delete movie');
+      }
+      setMovies((current) => current.filter((movie) => movie.id !== id));
+    } catch (error) {
+      console.error('Deletion failed', error);
+      setMessage(error?.message || 'Unable to delete movie.');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const getCombinedScore = (movie) => {
@@ -275,14 +396,34 @@ export default function MovieWatchlist() {
     setShowForm(true);
   };
 
-  const handleToggleWatched = (movieId) => {
-    setMovies((current) =>
-      current.map((movie) =>
-        movie.id === movieId ? { ...movie, watched: !movie.watched } : movie
-      )
-    );
-    if (editingMovieId === movieId) {
-      setFormData((prev) => ({ ...prev, watched: !prev.watched }));
+  const handleToggleWatched = async (movieId) => {
+    const target = movies.find((movie) => movie.id === movieId);
+    if (!target) return;
+    const payload = buildPayloadFromMovie({ ...target, watched: !target.watched });
+
+    try {
+      setIsSaving(true);
+      setMessage('');
+      const response = await fetch(`/api/watchlist/${movieId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || 'Failed to update movie');
+      }
+      setMovies((current) =>
+        current.map((movie) => (movie.id === movieId ? data.movie : movie)),
+      );
+      if (editingMovieId === movieId) {
+        setFormData((prev) => ({ ...prev, watched: data.movie.watched }));
+      }
+    } catch (error) {
+      console.error('Toggle watched failed', error);
+      setMessage(error?.message || 'Unable to update status.');
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -404,9 +545,30 @@ export default function MovieWatchlist() {
           </div>
         </div>
 
+        {(isLoading || isMigrating || isSaving) && (
+          <div className="flex items-center gap-2 text-sm text-white/70 mb-6">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            <span>
+              {isLoading
+                ? 'Loading watchlist…'
+                : isMigrating
+                ? 'Importing saved movies…'
+                : 'Saving changes…'}
+            </span>
+          </div>
+        )}
+
+        {!showForm && message && (
+          <div className="bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-sm text-white/80 mb-6">
+            {message}
+          </div>
+        )}
+
         {showForm && (
           <div className="bg-white/10 backdrop-blur-lg rounded-xl p-6 mb-6 border border-white/20">
-            <h2 className="text-xl font-semibold text-white mb-4">{editingMovieId ? 'Edit Movie' : 'Add New Movie'}</h2>
+            <h2 className="text-xl font-semibold text-white mb-4">
+              {editingMovieId ? 'Edit Movie' : 'Add New Movie'}
+            </h2>
             {editingMovieId ? (
               <p className="text-sm text-white/60 mb-4">
                 Updating <span className="text-white font-semibold">{formData.title || 'Untitled Movie'}</span>
@@ -428,136 +590,126 @@ export default function MovieWatchlist() {
                   onChange={(event) => setFormData({ ...formData, year: event.target.value })}
                   className="bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
                 />
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                <div>
-                  <label className="text-white/70 text-sm mb-1 block">IMDb (0-10)</label>
-                  <input
-                    type="number"
-                    step="0.1"
-                    min="0"
-                    max="10"
-                    placeholder="8.5"
-                    value={formData.imdb}
-                    onChange={(event) => setFormData({ ...formData, imdb: event.target.value })}
-                    className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                  />
-                </div>
-                <div>
-                  <label className="text-white/70 text-sm mb-1 block">RT Critics (0-100)</label>
-                  <input
-                    type="number"
-                    min="0"
-                    max="100"
-                    placeholder="95"
-                    value={formData.rottenTomatoes}
-                    onChange={(event) => setFormData({ ...formData, rottenTomatoes: event.target.value })}
-                    className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                  />
-                </div>
-                <div>
-                  <label className="text-white/70 text-sm mb-1 block">Metacritic (0-100)</label>
-                  <input
-                    type="number"
-                    min="0"
-                    max="100"
-                    placeholder="90"
-                    value={formData.metacritic}
-                    onChange={(event) => setFormData({ ...formData, metacritic: event.target.value })}
-                    className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                  />
-                </div>
-                <div>
-                  <label className="text-white/70 text-sm mb-1 block">Letterboxd (0-5)</label>
-                  <input
-                    type="number"
-                    step="0.1"
-                    min="0"
-                    max="5"
-                    placeholder="4.2"
-                    value={formData.letterboxd}
-                    onChange={(event) => setFormData({ ...formData, letterboxd: event.target.value })}
-                    className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                  />
-                </div>
-              </div>
-              <div className="grid grid-cols-1 gap-4">
-                <div>
-                  <label className="text-white/70 text-sm mb-1 block">Poster URL</label>
-                  <input
-                    type="url"
-                    placeholder="https://…"
-                    value={formData.posterUrl}
-                    onChange={(event) => setFormData({ ...formData, posterUrl: event.target.value })}
-                    className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                  />
-                </div>
-                <div>
-                  <label className="text-white/70 text-sm mb-1 block">Plot / Notes</label>
-                  <textarea
-                    rows={3}
-                    placeholder="Short synopsis or notes"
-                    value={formData.plot}
-                    onChange={(event) => setFormData({ ...formData, plot: event.target.value })}
-                    className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                  />
-                </div>
-              </div>
-              <div className="flex items-center gap-2 text-white/80">
                 <input
-                  id="watched-toggle"
-                  type="checkbox"
-                  checked={Boolean(formData.watched)}
-                  onChange={(event) => setFormData({ ...formData, watched: event.target.checked })}
-                  className="h-4 w-4 rounded border-white/40 bg-white/10 text-purple-500 focus:ring-purple-400 focus:outline-none"
+                  type="text"
+                  placeholder="IMDb Rating"
+                  value={formData.imdb}
+                  onChange={(event) => setFormData({ ...formData, imdb: event.target.value })}
+                  className="bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
                 />
-                <label htmlFor="watched-toggle" className="text-sm">Mark as watched</label>
+                <input
+                  type="text"
+                  placeholder="Rotten Tomatoes %"
+                  value={formData.rottenTomatoes}
+                  onChange={(event) => setFormData({ ...formData, rottenTomatoes: event.target.value })}
+                  className="bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                />
+                <input
+                  type="text"
+                  placeholder="Metacritic Score"
+                  value={formData.metacritic}
+                  onChange={(event) => setFormData({ ...formData, metacritic: event.target.value })}
+                  className="bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                />
+                <input
+                  type="text"
+                  placeholder="Letterboxd Rating"
+                  value={formData.letterboxd}
+                  onChange={(event) => setFormData({ ...formData, letterboxd: event.target.value })}
+                  className="bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                />
               </div>
+
+              <input
+                type="url"
+                placeholder="Poster URL"
+                value={formData.posterUrl}
+                onChange={(event) => setFormData({ ...formData, posterUrl: event.target.value })}
+                className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
+              />
+
+              <textarea
+                placeholder="Plot or notes"
+                value={formData.plot}
+                onChange={(event) => setFormData({ ...formData, plot: event.target.value })}
+                className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                rows={3}
+              />
+
               <div className="flex flex-wrap items-center gap-3">
+                <label className="inline-flex items-center gap-2 text-white">
+                  <input
+                    type="checkbox"
+                    checked={formData.watched}
+                    onChange={(event) =>
+                      setFormData({ ...formData, watched: event.target.checked })
+                    }
+                    className="h-4 w-4 rounded border-white/30 bg-white/10"
+                  />
+                  Mark as watched
+                </label>
+              </div>
+
+              {showForm && message ? (
+                <p className="text-purple-200 text-sm">{message}</p>
+              ) : null}
+
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   onClick={handleSubmit}
-                  className="bg-purple-600 hover:bg-purple-700 text-white px-6 py-2 rounded-lg transition-colors"
+                  disabled={isSaving}
+                  className={`px-4 py-2 rounded-lg transition-colors ${
+                    isSaving
+                      ? 'bg-purple-600/60 text-white/80 cursor-not-allowed'
+                      : 'bg-purple-600 hover:bg-purple-700 text-white'
+                  }`}
                 >
                   {editingMovieId ? 'Save Changes' : 'Add to Watchlist'}
                 </button>
                 <button
+                  type="button"
                   onClick={handleOmdbFetch}
+                  className="inline-flex items-center gap-2 px-4 py-2 border border-white/20 rounded-lg text-white hover:bg-white/10 transition-colors"
                   disabled={isFetching}
-                  className="flex items-center gap-2 bg-white/10 hover:bg-white/20 disabled:opacity-60 text-white px-4 py-2 rounded-lg transition-colors"
                 >
-                  {isFetching ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                  {isFetching ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <CloudDownload className="w-4 h-4" />
+                  )}
                   Fetch from OMDb
                 </button>
                 <button
                   onClick={handleCancelForm}
-                  className="bg-white/10 hover:bg-white/20 text-white px-6 py-2 rounded-lg transition-colors"
+                  className="bg-white/10 hover:bg-white/20 text-white px-4 py-2 rounded-lg transition-colors"
                 >
                   Cancel
                 </button>
-                {message && (
-                  <span className="text-sm text-white/70 mt-2 w-full">{message}</span>
-                )}
               </div>
             </div>
           </div>
         )}
 
-        {!hasMovies ? (
-          <div className="text-center py-16">
-            <Film className="w-16 h-16 text-white/30 mx-auto mb-4" />
-            <p className="text-white/50 text-lg">No movies in your watchlist yet</p>
-            <p className="text-white/30 text-sm mt-2">Click "Add Movie" to get started</p>
+        {!isLoading && !hasMovies && !showForm ? (
+          <div className="bg-white/10 border border-dashed border-white/30 rounded-xl p-10 text-center text-white/60">
+            <p className="text-lg">Your watchlist is empty.</p>
+            <p className="text-sm mt-2">Click “Add Movie” to start tracking what to watch next.</p>
           </div>
-        ) : visibleMovies.length === 0 ? (
+        ) : null}
+
+        {!isLoading && hasMovies && visibleMovies.length === 0 ? (
           <div className="text-center py-16">
             <p className="text-white/60 text-lg">No movies match your search.</p>
             <p className="text-white/40 text-sm mt-2">Try adjusting your filters.</p>
           </div>
-        ) : (
+        ) : null}
+
+        {!isLoading && visibleMovies.length > 0 ? (
           <div className="grid grid-cols-1 gap-4">
             {visibleMovies.map((movie) => {
               const combinedScoreValue = getCombinedScore(movie);
-              const formattedScore = typeof combinedScoreValue === 'number' ? combinedScoreValue.toFixed(1) : null;
+              const formattedScore =
+                typeof combinedScoreValue === 'number' ? combinedScoreValue.toFixed(1) : null;
               const verdict = describeCombinedScore(combinedScoreValue);
               return (
                 <div
@@ -598,25 +750,28 @@ export default function MovieWatchlist() {
                         <div className="flex items-center gap-2">
                           <button
                             onClick={() => handleToggleWatched(movie.id)}
-                            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-sm transition-colors ${movie.watched ? 'border-emerald-400/40 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20' : 'border-white/20 text-white/70 hover:bg-white/10'}`}
+                            disabled={isSaving}
+                            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-sm transition-colors ${
+                              movie.watched
+                                ? 'border-emerald-400/40 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20'
+                                : 'border-white/20 text-white/70 hover:bg-white/10'
+                            } ${isSaving ? 'opacity-60 cursor-not-allowed' : ''}`}
                           >
-                            {movie.watched ? (
-                              <CheckCircle className="w-4 h-4" />
-                            ) : (
-                              <Circle className="w-4 h-4" />
-                            )}
+                            {movie.watched ? <CheckCircle className="w-4 h-4" /> : <Circle className="w-4 h-4" />}
                             {movie.watched ? 'Watched' : 'Mark watched'}
                           </button>
                           <button
                             onClick={() => handleEditMovie(movie)}
-                            className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-white/20 text-sm text-white/70 hover:bg-white/10 transition-colors"
+                            disabled={isSaving}
+                            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border border-white/20 text-sm text-white/70 hover:bg-white/10 transition-colors ${isSaving ? 'opacity-60 cursor-not-allowed' : ''}`}
                           >
                             <Pencil className="w-4 h-4" />
                             Edit
                           </button>
                           <button
                             onClick={() => deleteMovie(movie.id)}
-                            className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-red-400/40 text-sm text-red-300 hover:bg-red-500/10 transition-colors"
+                            disabled={isSaving}
+                            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border border-red-400/40 text-sm text-red-300 hover:bg-red-500/10 transition-colors ${isSaving ? 'opacity-60 cursor-not-allowed' : ''}`}
                           >
                             <Trash2 className="w-4 h-4" />
                             Delete
@@ -665,9 +820,7 @@ export default function MovieWatchlist() {
                       </div>
 
                       {movie.plot && (
-                        <p className="text-white/70 text-sm leading-relaxed mt-3">
-                          {movie.plot}
-                        </p>
+                        <p className="text-white/70 text-sm leading-relaxed mt-3">{movie.plot}</p>
                       )}
 
                       <p className="text-white/40 text-xs mt-4">
@@ -679,7 +832,7 @@ export default function MovieWatchlist() {
               );
             })}
           </div>
-        )}
+        ) : null}
       </div>
 
       {showSettings && (
@@ -724,5 +877,23 @@ function createEmptyMovie() {
     watched: false,
     letterboxd: '',
     addedAt: Date.now(),
+  };
+}
+
+function buildPayloadFromMovie(movie) {
+  return {
+    title: (movie?.title || '').trim(),
+    year: movie?.year ? String(movie.year).trim() : '',
+    imdb: movie?.imdb ? String(movie.imdb).trim() : '',
+    rottenTomatoes: movie?.rottenTomatoes ? String(movie.rottenTomatoes).trim() : '',
+    metacritic: movie?.metacritic ? String(movie.metacritic).trim() : '',
+    posterUrl: movie?.posterUrl ? String(movie.posterUrl).trim() : '',
+    plot: movie?.plot ? String(movie.plot).trim() : '',
+    letterboxd: movie?.letterboxd ? String(movie.letterboxd).trim() : '',
+    watched: Boolean(movie?.watched),
+    addedAt:
+      typeof movie?.addedAt === 'number' && Number.isFinite(movie.addedAt)
+        ? movie.addedAt
+        : Date.now(),
   };
 }
