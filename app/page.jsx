@@ -108,6 +108,7 @@ function normalizeLegacyMovie(movie) {
     id: movie.id || generateId(),
     title: movie.title || '',
     year: movie.year || '',
+    genre: movie.genre || movie.genres || '',
     imdb: movie.imdb || '',
     rottenTomatoes: movie.rottenTomatoes || '',
     metacritic: movie.metacritic || movie.rtAudience || '',
@@ -445,7 +446,8 @@ export default function MovieWatchlist() {
         if (!search) return true;
         return (
           movie.title.toLowerCase().includes(search) ||
-          String(movie.year).toLowerCase().includes(search)
+          String(movie.year).toLowerCase().includes(search) ||
+          (movie.genre || '').toLowerCase().includes(search)
         );
       })
       .map((movie) => ({ ...movie }));
@@ -597,6 +599,7 @@ export default function MovieWatchlist() {
       imdb: movie.imdb || '',
       rottenTomatoes: movie.rottenTomatoes || '',
       metacritic: movie.metacritic || '',
+      genre: movie.genre || '',
       posterUrl: movie.posterUrl || '',
       plot: movie.plot || '',
       letterboxd: movie.letterboxd || '',
@@ -683,6 +686,7 @@ export default function MovieWatchlist() {
         ...prev,
         title: data.Title || prev.title,
         year: data.Year || prev.year,
+        genre: data.Genre && data.Genre !== 'N/A' ? data.Genre : prev.genre,
         imdb: data.imdbRating && data.imdbRating !== 'N/A' ? String(data.imdbRating) : prev.imdb,
         rottenTomatoes:
           rtEntry?.Value && rtEntry.Value !== 'N/A'
@@ -925,18 +929,25 @@ export default function MovieWatchlist() {
                   onChange={(event) => setFormData({ ...formData, title: event.target.value })}
                   className="bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
                 />
-                <input
-                  type="text"
-                  placeholder="Year"
-                  value={formData.year}
-                  onChange={(event) => setFormData({ ...formData, year: event.target.value })}
-                  className="bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                />
-                <input
-                  type="text"
-                  placeholder="IMDb Rating"
-                  value={formData.imdb}
-                  onChange={(event) => setFormData({ ...formData, imdb: event.target.value })}
+              <input
+                type="text"
+                placeholder="Year"
+                value={formData.year}
+                onChange={(event) => setFormData({ ...formData, year: event.target.value })}
+                className="bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
+              />
+              <input
+                type="text"
+                placeholder="Genres (e.g. Drama, Thriller)"
+                value={formData.genre}
+                onChange={(event) => setFormData({ ...formData, genre: event.target.value })}
+                className="bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
+              />
+              <input
+                type="text"
+                placeholder="IMDb Rating"
+                value={formData.imdb}
+                onChange={(event) => setFormData({ ...formData, imdb: event.target.value })}
                   className="bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-purple-500"
                 />
                 <input
@@ -1120,7 +1131,11 @@ export default function MovieWatchlist() {
                           </button>
                         </div>
                       </div>
-
+                        {movie.genre ? (
+                          <p className="text-white/70 text-xs">
+                            {movie.genre}
+                          </p>
+                        ) : null}
                       {formattedScore && (
                         <div className="flex flex-wrap items-center gap-2 mt-3">
                           <Star className="w-4 h-4 text-purple-400 fill-purple-400" />
@@ -1294,6 +1309,7 @@ function createEmptyMovie() {
     id: generateId(),
     title: '',
     year: '',
+    genre: '',
     imdb: '',
     rottenTomatoes: '',
     metacritic: '',
@@ -1311,6 +1327,7 @@ function buildPayloadFromMovie(movie) {
     year: movie?.year ? String(movie.year).trim() : '',
     imdb: movie?.imdb ? String(movie.imdb).trim() : '',
     rottenTomatoes: movie?.rottenTomatoes ? String(movie.rottenTomatoes).trim() : '',
+    genre: movie?.genre ? String(movie.genre).trim() : '',
     metacritic: movie?.metacritic ? String(movie.metacritic).trim() : '',
     posterUrl: movie?.posterUrl ? String(movie.posterUrl).trim() : '',
     plot: movie?.plot ? String(movie.plot).trim() : '',
