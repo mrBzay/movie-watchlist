@@ -18,7 +18,6 @@ import {
 const STORAGE_KEYS = {
   watchlist: 'watchlist.v1',
   legacy: 'watchlist-movies',
-  omdb: 'watchlist.omdbKey',
 };
 
 function clamp(value, min, max) {
@@ -99,30 +98,6 @@ function describeCombinedScore(score) {
   return 'Can Skip It';
 }
 
-function useLocalStorageState(key, defaultValue) {
-  const [state, setState] = useState(() => {
-    if (typeof window === 'undefined') return defaultValue;
-    try {
-      const stored = window.localStorage.getItem(key);
-      return stored ? JSON.parse(stored) : defaultValue;
-    } catch (err) {
-      console.error('Failed to read localStorage key', key, err);
-      return defaultValue;
-    }
-  });
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    try {
-      window.localStorage.setItem(key, JSON.stringify(state));
-    } catch (err) {
-      console.error('Failed to persist localStorage key', key, err);
-    }
-  }, [key, state]);
-
-  return [state, setState];
-}
-
 function normalizeLegacyMovie(movie) {
   if (!movie) return null;
   const addedAt =
@@ -150,8 +125,17 @@ function ensurePercent(value) {
 }
 
 export default function MovieWatchlist() {
+  const [user, setUser] = useState(null);
+  const [isSessionLoading, setIsSessionLoading] = useState(true);
+  const [authMode, setAuthMode] = useState('login');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [isAuthSubmitting, setIsAuthSubmitting] = useState(false);
+
   const [movies, setMovies] = useState([]);
-  const [omdbKey, setOmdbKey] = useLocalStorageState(STORAGE_KEYS.omdb, '');
+  const [omdbKey, setOmdbKey] = useState('');
+  const [isSavingOmdbKey, setIsSavingOmdbKey] = useState(false);
   const [showForm, setShowForm] = useState(false);
   const [query, setQuery] = useState('');
   const [sortBy, setSortBy] = useState('addedDesc');
@@ -159,6 +143,11 @@ export default function MovieWatchlist() {
   const [message, setMessage] = useState('');
   const [isFetching, setIsFetching] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showUserAdmin, setShowUserAdmin] = useState(false);
+  const [userAdminError, setUserAdminError] = useState('');
+  const [userList, setUserList] = useState([]);
+  const [isLoadingUsers, setIsLoadingUsers] = useState(false);
+  const [updatingUserId, setUpdatingUserId] = useState(null);
   const [formData, setFormData] = useState(() => createEmptyMovie());
   const [editingMovieId, setEditingMovieId] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -166,11 +155,45 @@ export default function MovieWatchlist() {
   const [isMigrating, setIsMigrating] = useState(false);
   const [hasMigratedLocal, setHasMigratedLocal] = useState(false);
 
+  const loadSession = useCallback(async () => {
+    try {
+      setIsSessionLoading(true);
+      const response = await fetch('/api/auth/session', { cache: 'no-store' });
+      const data = await response.json().catch(() => ({}));
+      if (response.ok && data?.user) {
+        setUser(data.user);
+        setOmdbKey(data.user.omdbKey ?? '');
+      } else {
+        setUser(null);
+        setOmdbKey('');
+        setMovies([]);
+      }
+    } catch (error) {
+      console.error('Failed to load session', error);
+      setUser(null);
+      setOmdbKey('');
+      setMovies([]);
+    } finally {
+      setIsSessionLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadSession();
+  }, [loadSession]);
+
   const fetchWatchlist = useCallback(async () => {
+    if (!user) return;
     try {
       setIsLoading(true);
       setMessage('');
       const response = await fetch('/api/watchlist', { cache: 'no-store' });
+      if (response.status === 401) {
+        setUser(null);
+        setMovies([]);
+        setMessage('Session expired. Please sign in again.');
+        return;
+      }
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
         throw new Error(data?.error || 'Failed to load watchlist');
@@ -182,14 +205,22 @@ export default function MovieWatchlist() {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [user]);
 
   useEffect(() => {
+    if (!user) return;
     fetchWatchlist();
-  }, [fetchWatchlist]);
+  }, [fetchWatchlist, user]);
+
+  useEffect(() => {
+    if (!user && !isSessionLoading) {
+      setIsLoading(false);
+    }
+  }, [isSessionLoading, user]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
+    if (!user || isSessionLoading) return;
     if (isLoading || hasMigratedLocal || movies.length > 0) return;
 
     const migrate = async () => {
@@ -223,6 +254,12 @@ export default function MovieWatchlist() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
           });
+          if (response.status === 401) {
+            setUser(null);
+            setMovies([]);
+            setMessage('Session expired. Please sign in again.');
+            return;
+          }
           if (!response.ok) {
             const data = await response.json().catch(() => ({}));
             throw new Error(data?.error || 'Failed to import movie');
@@ -244,7 +281,162 @@ export default function MovieWatchlist() {
     };
 
     migrate();
-  }, [fetchWatchlist, hasMigratedLocal, isLoading, movies.length]);
+  }, [fetchWatchlist, hasMigratedLocal, isLoading, isSessionLoading, movies.length, user]);
+
+  useEffect(() => {
+    if (!showUserAdmin || user?.role !== 'admin') return;
+    const loadUsers = async () => {
+      try {
+        setIsLoadingUsers(true);
+        setUserAdminError('');
+        const response = await fetch('/api/users', { cache: 'no-store' });
+        if (response.status === 401) {
+          setUser(null);
+          setMovies([]);
+          setShowUserAdmin(false);
+          setMessage('Session expired. Please sign in again.');
+          return;
+        }
+        const data = await response.json().catch(() => ({}));
+        if (response.status === 403) {
+          setUserAdminError(data?.error || 'Admin privileges required.');
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(data?.error || 'Failed to load users');
+        }
+        setUserList(Array.isArray(data?.users) ? data.users : []);
+      } catch (error) {
+        console.error('Failed to load users', error);
+        setUserAdminError(error?.message || 'Unable to load users.');
+      } finally {
+        setIsLoadingUsers(false);
+      }
+    };
+
+    loadUsers();
+  }, [showUserAdmin, user?.role]);
+
+  const handleAuthSubmit = async (event) => {
+    event.preventDefault();
+    setAuthError('');
+    setMessage('');
+    try {
+      setIsAuthSubmitting(true);
+      const endpoint = authMode === 'login' ? '/api/auth/login' : '/api/auth/register';
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: authEmail, password: authPassword }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || 'Authentication failed');
+      }
+      setUser(data.user ?? null);
+      setOmdbKey(data.user?.omdbKey ?? '');
+      setAuthEmail('');
+      setAuthPassword('');
+      setHasMigratedLocal(false);
+      setMessage(authMode === 'login' ? 'Signed in successfully.' : 'Account created.');
+    } catch (error) {
+      console.error('Authentication failed', error);
+      setAuthError(error?.message || 'Unable to authenticate.');
+    } finally {
+      setIsAuthSubmitting(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch (error) {
+      console.error('Logout failed', error);
+    } finally {
+      setUser(null);
+      setOmdbKey('');
+      setMovies([]);
+      setShowForm(false);
+      setShowSettings(false);
+      setShowUserAdmin(false);
+      setMessage('Signed out.');
+      setHasMigratedLocal(false);
+    }
+  };
+
+  const handleSaveOmdbKey = async () => {
+    try {
+      setIsSavingOmdbKey(true);
+      const response = await fetch('/api/settings/omdb', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ omdbKey }),
+      });
+      if (response.status === 401) {
+        setUser(null);
+        setMovies([]);
+        setShowSettings(false);
+        setMessage('Session expired. Please sign in again.');
+        return;
+      }
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || 'Failed to save OMDb key');
+      }
+      setOmdbKey(data?.omdbKey ?? '');
+      setMessage('Saved OMDb key.');
+    } catch (error) {
+      console.error('Saving OMDb key failed', error);
+      setMessage(error?.message || 'Unable to save OMDb key.');
+    } finally {
+      setIsSavingOmdbKey(false);
+    }
+  };
+
+  const handleRoleChange = async (targetUserId, role) => {
+    try {
+      setUserAdminError('');
+      setUpdatingUserId(targetUserId);
+      const response = await fetch(`/api/users/${targetUserId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role }),
+      });
+      if (response.status === 401) {
+        setUser(null);
+        setMovies([]);
+        setShowUserAdmin(false);
+        setMessage('Session expired. Please sign in again.');
+        return;
+      }
+      const data = await response.json().catch(() => ({}));
+      if (response.status === 403) {
+        setUserAdminError(data?.error || 'Admin privileges required.');
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(data?.error || 'Failed to update role');
+      }
+      setUserList((current) =>
+        current.map((entry) =>
+          entry.id === targetUserId ? { ...entry, role: data.user?.role ?? entry.role } : entry,
+        ),
+      );
+      if (user?.id === targetUserId) {
+        const nextRole = data.user?.role ?? role;
+        setUser((current) => (current ? { ...current, role: nextRole } : current));
+        if (nextRole !== 'admin') {
+          setShowUserAdmin(false);
+        }
+      }
+      setMessage('Updated user role.');
+    } catch (error) {
+      console.error('Failed to update role', error);
+      setUserAdminError(error?.message || 'Unable to update role.');
+    } finally {
+      setUpdatingUserId(null);
+    }
+  };
 
   const filteredMovies = useMemo(() => {
     const search = query.trim().toLowerCase();
@@ -309,6 +501,12 @@ export default function MovieWatchlist() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         });
+        if (response.status === 401) {
+          setUser(null);
+          setMovies([]);
+          setShowForm(false);
+          throw new Error('Session expired. Please sign in again.');
+        }
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
           throw new Error(data?.error || 'Failed to update movie');
@@ -322,6 +520,12 @@ export default function MovieWatchlist() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         });
+        if (response.status === 401) {
+          setUser(null);
+          setMovies([]);
+          setShowForm(false);
+          throw new Error('Session expired. Please sign in again.');
+        }
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
           throw new Error(data?.error || 'Failed to add movie');
@@ -345,6 +549,12 @@ export default function MovieWatchlist() {
       setIsSaving(true);
       setMessage('');
       const response = await fetch(`/api/watchlist/${id}`, { method: 'DELETE' });
+      if (response.status === 401) {
+        setUser(null);
+        setMovies([]);
+        setShowForm(false);
+        throw new Error('Session expired. Please sign in again.');
+      }
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
         throw new Error(data?.error || 'Failed to delete movie');
@@ -409,6 +619,12 @@ export default function MovieWatchlist() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
+      if (response.status === 401) {
+        setUser(null);
+        setMovies([]);
+        setShowForm(false);
+        throw new Error('Session expired. Please sign in again.');
+      }
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
         throw new Error(data?.error || 'Failed to update movie');
@@ -490,14 +706,147 @@ export default function MovieWatchlist() {
   const hasMovies = movies.length > 0;
   const visibleMovies = filteredMovies;
 
+  if (isSessionLoading) {
+    return (
+      <div className="min-h-screen bg-neutral-950 flex flex-col items-center justify-center text-white">
+        <Loader2 className="w-8 h-8 animate-spin text-purple-300" />
+        <p className="mt-4 text-sm text-white/60">Loading your session…</p>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-neutral-950 flex items-center justify-center p-4">
+        <div className="w-full max-w-md bg-slate-900 border border-white/10 rounded-xl p-6 space-y-6">
+          <div className="flex items-center gap-3">
+            <Film className="w-8 h-8 text-purple-400" />
+            <div>
+              <h1 className="text-2xl font-bold text-white">Movie Watchlist</h1>
+              <p className="text-white/50 text-sm">Sign in to access your saved movies.</p>
+            </div>
+          </div>
+
+          <form onSubmit={handleAuthSubmit} className="space-y-4">
+            <div className="space-y-2">
+              <label className="block text-sm text-white/70" htmlFor="email">
+                Email
+              </label>
+              <input
+                id="email"
+                type="email"
+                value={authEmail}
+                onChange={(event) => setAuthEmail(event.target.value)}
+                className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/40 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                placeholder="you@example.com"
+                required
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="block text-sm text-white/70" htmlFor="password">
+                Password
+              </label>
+              <input
+                id="password"
+                type="password"
+                value={authPassword}
+                onChange={(event) => setAuthPassword(event.target.value)}
+                className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/40 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                placeholder="Minimum 8 characters"
+                required
+              />
+            </div>
+
+            {authError ? (
+              <div className="bg-red-500/10 border border-red-500/40 text-red-200 px-3 py-2 rounded-lg text-sm">
+                {authError}
+              </div>
+            ) : null}
+
+            <button
+              type="submit"
+              disabled={isAuthSubmitting || !authEmail || !authPassword}
+              className={`w-full flex items-center justify-center gap-2 rounded-lg px-4 py-2 font-medium transition-colors ${
+                isAuthSubmitting
+                  ? 'bg-purple-600/60 text-white/80 cursor-not-allowed'
+                  : 'bg-purple-600 hover:bg-purple-700 text-white'
+              }`}
+            >
+              {isAuthSubmitting ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  {authMode === 'login' ? 'Signing in…' : 'Creating account…'}
+                </>
+              ) : authMode === 'login' ? (
+                'Sign In'
+              ) : (
+                'Create Account'
+              )}
+            </button>
+          </form>
+
+          <div className="flex items-center justify-between text-sm text-white/60">
+            <span>
+              {authMode === 'login'
+                ? "Don't have an account?"
+                : 'Already have an account?'}
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                setAuthMode((mode) => (mode === 'login' ? 'register' : 'login'));
+                setAuthError('');
+              }}
+              className="text-purple-300 hover:text-purple-200"
+            >
+              {authMode === 'login' ? 'Create one' : 'Sign in'}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 p-4 md:p-8">
       <div className="max-w-5xl mx-auto">
-        <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between mb-8">
-          <div className="flex items-center gap-3">
-            <Film className="w-8 h-8 text-purple-400" />
-            <h1 className="text-3xl md:text-4xl font-bold text-white">My Watchlist</h1>
+        <div className="flex flex-col gap-6 mb-8">
+          <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+            <div className="flex items-center gap-3">
+              <Film className="w-8 h-8 text-purple-400" />
+              <div>
+                <h1 className="text-3xl md:text-4xl font-bold text-white">My Watchlist</h1>
+                <p className="text-sm text-white/60">Signed in as {user.email}</p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 justify-start md:justify-end">
+              <span className="text-xs uppercase tracking-wide bg-white/10 text-white/60 px-3 py-1 rounded-full">
+                {user.role === 'admin' ? 'Admin' : 'Member'}
+              </span>
+              {user.role === 'admin' ? (
+                <button
+                  onClick={() => setShowUserAdmin(true)}
+                  className="flex items-center gap-2 bg-white/10 hover:bg-white/20 text-white px-4 py-2 rounded-lg transition-colors"
+                >
+                  Manage Users
+                </button>
+              ) : null}
+              <button
+                onClick={() => setShowSettings(true)}
+                className="flex items-center gap-2 bg-white/10 hover:bg-white/20 text-white px-4 py-2 rounded-lg transition-colors"
+              >
+                <SettingsIcon className="w-4 h-4" />
+                OMDb Key
+              </button>
+              <button
+                onClick={handleLogout}
+                className="bg-red-500/20 hover:bg-red-500/30 text-red-200 px-4 py-2 rounded-lg transition-colors"
+              >
+                Sign Out
+              </button>
+            </div>
           </div>
+
           <div className="flex flex-wrap items-center gap-3">
             <div className="relative">
               <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-white/40" />
@@ -534,13 +883,6 @@ export default function MovieWatchlist() {
             >
               <Plus className="w-5 h-5" />
               Add Movie
-            </button>
-            <button
-              onClick={() => setShowSettings(true)}
-              className="flex items-center gap-2 bg-white/10 hover:bg-white/20 text-white px-4 py-2 rounded-lg transition-colors"
-            >
-              <SettingsIcon className="w-4 h-4" />
-              OMDb Key
             </button>
           </div>
         </div>
@@ -840,7 +1182,8 @@ export default function MovieWatchlist() {
           <div className="bg-slate-900 border border-white/10 rounded-xl p-6 w-full max-w-md">
             <h3 className="text-xl font-semibold text-white mb-2">OMDb Settings</h3>
             <p className="text-white/60 text-sm mb-4">
-              Store your OMDb API key locally to enable one-click lookups for ratings and year details.
+              Save your OMDb API key with your account to enable one-click lookups for ratings and
+              summaries across your devices.
             </p>
             <input
               type="text"
@@ -849,7 +1192,22 @@ export default function MovieWatchlist() {
               placeholder="e.g. abcd1234"
               className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-white/40 focus:outline-none focus:ring-2 focus:ring-purple-500"
             />
+            <div className="flex justify-between items-center gap-2 mt-4 text-xs text-white/40">
+              <span>Leave blank to remove the stored key.</span>
+              {isSavingOmdbKey ? <Loader2 className="w-4 h-4 animate-spin text-white/60" /> : null}
+            </div>
             <div className="flex justify-end gap-2 mt-4">
+              <button
+                onClick={handleSaveOmdbKey}
+                disabled={isSavingOmdbKey}
+                className={`px-4 py-2 rounded-lg transition-colors ${
+                  isSavingOmdbKey
+                    ? 'bg-purple-600/60 text-white/80 cursor-not-allowed'
+                    : 'bg-purple-600 hover:bg-purple-700 text-white'
+                }`}
+              >
+                {isSavingOmdbKey ? 'Saving…' : 'Save'}
+              </button>
               <button
                 onClick={() => setShowSettings(false)}
                 className="bg-white/10 hover:bg-white/20 text-white px-4 py-2 rounded-lg transition-colors"
@@ -857,6 +1215,73 @@ export default function MovieWatchlist() {
                 Close
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {showUserAdmin && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-white/10 rounded-xl p-6 w-full max-w-2xl">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h3 className="text-xl font-semibold text-white">Manage Users</h3>
+                <p className="text-white/50 text-sm">Promote or demote accounts between member and admin roles.</p>
+              </div>
+              <button
+                onClick={() => {
+                  setShowUserAdmin(false);
+                  setUserAdminError('');
+                }}
+                className="bg-white/10 hover:bg-white/20 text-white px-4 py-2 rounded-lg transition-colors"
+              >
+                Close
+              </button>
+            </div>
+
+            {userAdminError ? (
+              <div className="bg-red-500/10 border border-red-500/40 text-red-200 px-3 py-2 rounded-lg text-sm mb-4">
+                {userAdminError}
+              </div>
+            ) : null}
+
+            {isLoadingUsers ? (
+              <div className="flex items-center gap-2 text-white/70 text-sm">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>Loading users…</span>
+              </div>
+            ) : userList.length === 0 ? (
+              <p className="text-white/60 text-sm">No other users have registered yet.</p>
+            ) : (
+              <div className="space-y-3 max-h-80 overflow-y-auto pr-1">
+                {userList.map((entry) => (
+                  <div
+                    key={entry.id}
+                    className="flex items-center justify-between gap-3 border border-white/10 rounded-lg px-4 py-3"
+                  >
+                    <div>
+                      <p className="text-white font-medium">{entry.email}</p>
+                      <p className="text-xs text-white/40">
+                        {entry.id === user.id ? 'This is you' : entry.role === 'admin' ? 'Admin' : 'Member'}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {updatingUserId === entry.id ? (
+                        <Loader2 className="w-4 h-4 animate-spin text-white/70" />
+                      ) : null}
+                      <select
+                        value={entry.role}
+                        onChange={(event) => handleRoleChange(entry.id, event.target.value)}
+                        disabled={updatingUserId === entry.id}
+                        className="bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
+                      >
+                        <option value="user">Member</option>
+                        <option value="admin">Admin</option>
+                      </select>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}
